@@ -1,10 +1,12 @@
 import json
 import os
+import re
 import shutil
 from datetime import date, datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_DATABASE = os.path.join(BASE_DIR, "data_antrean.json")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+FILE_DATABASE = os.path.join(DATA_DIR, "antrean.json")
 
 PIN_DOKTER = os.environ.get("PIN_DOKTER", "1234")
 MAKS_PERCOBAAN_PIN = 3
@@ -22,6 +24,7 @@ STATUS_DIPANGGIL = "dipanggil"
 STATUS_SELESAI = "selesai"
 STATUS_DILEWATI = "dilewati"
 
+
 class SistemRumahSakit:
     def __init__(self, nama_rs: str):
         self.nama_rs = nama_rs
@@ -30,68 +33,98 @@ class SistemRumahSakit:
         self.muat_data()
 
     # ------------------------------------------------------------------
-    # Penyimpanan data
+    # Penyimpanan data 
     # ------------------------------------------------------------------
-    def _inisialisasi_data_baru(self):
-        """Membuat struktur data kosong untuk hari ini"""
-        self.antrean_per_bidang = {b: [] for b in self.daftar_bidang}
-        self.counter_nomor_urut = {b: 0 for b in self.daftar_bidang}
+    def _hari_kosong(self):
+        return {
+            "antrean": {b: [] for b in self.daftar_bidang},
+            "counter": {b: 0 for b in self.daftar_bidang},
+        }
 
-    def _cadangkan_file(self, akhiran: str):
-        """Menyalin file database lama agar tidak hilang tertimpa"""
-        tujuan = os.path.join(BASE_DIR, f"data_antrean_{akhiran}.json")
-        try:
-            shutil.copy(FILE_DATABASE, tujuan)
-            return tujuan
-        except OSError:
-            return None
-
-    def muat_data(self):
-        """Membaca data dari file JSON; nomor urut di-reset setiap hari"""
-        self._inisialisasi_data_baru()
-
-        if not os.path.exists(FILE_DATABASE):
-            return
-
-        try:
-            with open(FILE_DATABASE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-            if not isinstance(data, dict):
-                raise ValueError("Format data tidak valid")
-        except (json.JSONDecodeError, ValueError, OSError):
-            cadangan = self._cadangkan_file("rusak_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
-            print("⚠️  File data rusak, memulai data baru.")
-            if cadangan:
-                print(f"    File lama disimpan di: {cadangan}")
-            return
-
-        # Ganti hari -> arsipkan data kemarin, mulai nomor urut dari 1 lagi
-        tanggal_file = data.get("tanggal", self.tanggal)
-        if tanggal_file != self.tanggal:
-            self._cadangkan_file(str(tanggal_file))
-            return
-
-        antrean = data.get("antrean", {})
-        counter = data.get("counter", {})
+    def _normalisasi_hari(self, data_hari):
+        """Melengkapi struktur data satu hari agar semua bidang tersedia"""
+        hari = self._hari_kosong()
+        if not isinstance(data_hari, dict):
+            return hari
+        antrean = data_hari.get("antrean", {})
+        counter = data_hari.get("counter", {})
         for bidang in self.daftar_bidang:
             pasien_list = antrean.get(bidang, [])
+            if not isinstance(pasien_list, list):
+                pasien_list = []
             for p in pasien_list:
-                p.setdefault("status", STATUS_MENUNGGU)  # kompatibel dengan data versi lama
-            self.antrean_per_bidang[bidang] = pasien_list
+                p.setdefault("status", STATUS_MENUNGGU)
+            hari["antrean"][bidang] = pasien_list
             try:
-                self.counter_nomor_urut[bidang] = int(counter.get(bidang, 0))
+                hari["counter"][bidang] = max(int(counter.get(bidang, 0)), len(pasien_list))
             except (TypeError, ValueError):
-                self.counter_nomor_urut[bidang] = len(pasien_list)
+                hari["counter"][bidang] = len(pasien_list)
+        return hari
+
+    @staticmethod
+    def _baca_json(path):
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _migrasi_file_lama(self) -> int:
+        """Memindahkan data dari versi lama (data_antrean*.json) satu kali saja"""
+        pola = re.compile(r"^data_antrean(?:_(\d{4}-\d{2}-\d{2}))?\.json$")
+        jumlah = 0
+        for nama in sorted(os.listdir(BASE_DIR)):
+            cocok = pola.match(nama)
+            if not cocok:
+                continue
+            data = self._baca_json(os.path.join(BASE_DIR, nama))
+            if not data or "antrean" not in data:
+                continue
+            tanggal = str(data.get("tanggal") or cocok.group(1) or self.tanggal)
+            self.semua_hari[tanggal] = self._normalisasi_hari(data)
+            jumlah += 1
+        return jumlah
+
+    def muat_data(self):
+        """Membaca semua data dari satu file JSON"""
+        self.semua_hari = {}
+        hasil_migrasi = 0
+
+        if os.path.exists(FILE_DATABASE):
+            data = self._baca_json(FILE_DATABASE)
+            if data is None:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                cadangan = os.path.join(
+                    DATA_DIR, "antrean_rusak_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json")
+                try:
+                    shutil.copy(FILE_DATABASE, cadangan)
+                    print(f"⚠️  File data rusak, memulai data baru. File lama disimpan di: {cadangan}")
+                except OSError:
+                    print("⚠️  File data rusak, memulai data baru.")
+            else:
+                for tanggal, data_hari in data.get("hari", {}).items():
+                    self.semua_hari[tanggal] = self._normalisasi_hari(data_hari)
+        else:
+            hasil_migrasi = self._migrasi_file_lama()
+
+        if self.tanggal not in self.semua_hari:
+            self.semua_hari[self.tanggal] = self._hari_kosong()
+        hari_ini = self.semua_hari[self.tanggal]
+        self.antrean_per_bidang = hari_ini["antrean"]
+        self.counter_nomor_urut = hari_ini["counter"]
+
+        if hasil_migrasi:
+            self.simpan_data()
+            print(f"ℹ️  Data lama ({hasil_migrasi} hari) dipindahkan ke {FILE_DATABASE}.")
+            print("    File data_antrean*.json yang lama boleh dihapus.")
 
     def simpan_data(self):
         """Menyimpan data secara atomik (tulis ke file sementara lalu ganti)"""
-        data = {
-            "tanggal": self.tanggal,
-            "antrean": self.antrean_per_bidang,
-            "counter": self.counter_nomor_urut,
-        }
+        data = {"hari": {t: d for t, d in self.semua_hari.items() if any(d["antrean"].values())}}
         sementara = FILE_DATABASE + ".tmp"
         try:
+            os.makedirs(DATA_DIR, exist_ok=True)
             with open(sementara, "w", encoding="utf-8") as file:
                 json.dump(data, file, indent=4, ensure_ascii=False)
             os.replace(sementara, FILE_DATABASE)
@@ -261,7 +294,8 @@ class SistemRumahSakit:
     def _panggil_berikutnya(self, bidang: str):
         sedang = self._pasien_sedang_dipanggil(bidang)
         if sedang:
-            sedang["status"] = STATUS_SELESAI  # pasien sebelumnya dianggap selesai
+            sedang["status"] = STATUS_SELESAI
+            sedang["waktu_selesai"] = self._sekarang()
 
         menunggu = self._pasien_menunggu(bidang)
         if not menunggu:
@@ -271,6 +305,7 @@ class SistemRumahSakit:
 
         berikutnya = menunggu[0]
         berikutnya["status"] = STATUS_DIPANGGIL
+        berikutnya["waktu_dipanggil"] = self._sekarang()
         self.simpan_data()
         print(f"\n📢 Memanggil {self._kode_antrean(bidang, berikutnya['nomor_urut'])} - {berikutnya['nama']}")
         print(f"   Umur: {berikutnya['umur']} tahun | Keluhan: {berikutnya['keluhan']}")
@@ -281,6 +316,7 @@ class SistemRumahSakit:
             print("❌ Tidak ada pasien yang sedang dipanggil.")
             return
         sedang["status"] = status_baru
+        sedang["waktu_selesai"] = self._sekarang()
         self.simpan_data()
         print(f"✅ {self._kode_antrean(bidang, sedang['nomor_urut'])} ditandai {status_baru}.")
 
@@ -315,6 +351,127 @@ class SistemRumahSakit:
                 print("❌ Pilihan tidak valid. Silakan masukkan angka 1-4.")
 
     # ------------------------------------------------------------------
+    # Laporan & riwayat
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sekarang() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    @staticmethod
+    def _selisih_menit(awal, akhir):
+        """Selisih dua jam (HH:MM:SS) dalam menit; None jika data tidak lengkap"""
+        try:
+            fmt = "%H:%M:%S"
+            selisih = (datetime.strptime(akhir, fmt) - datetime.strptime(awal, fmt)).total_seconds() / 60
+        except (TypeError, ValueError):
+            return None
+        return selisih if selisih >= 0 else None
+
+    def _cetak_laporan(self, tanggal: str, antrean: dict):
+        """Mencetak ringkasan per poli + daftar nama pasien yang dilewati"""
+        print("\n" + "=" * 60)
+        print(f" LAPORAN ANTREAN - {tanggal}")
+        print("=" * 60)
+
+        total = {STATUS_SELESAI: 0, STATUS_DILEWATI: 0, "belum": 0, "semua": 0}
+        semua_dilewati = []
+
+        for bidang in self.daftar_bidang:
+            pasien_list = antrean.get(bidang, [])
+            if not pasien_list:
+                continue
+
+            selesai = [p for p in pasien_list if p.get("status") == STATUS_SELESAI]
+            dilewati = [p for p in pasien_list if p.get("status") == STATUS_DILEWATI]
+            belum = [p for p in pasien_list
+                     if p.get("status") in (STATUS_MENUNGGU, STATUS_DIPANGGIL)]
+
+            tunggu = [m for m in (self._selisih_menit(p.get("waktu_daftar"), p.get("waktu_dipanggil"))
+                                  for p in pasien_list) if m is not None]
+            rata2 = f"{sum(tunggu) / len(tunggu):.1f} menit" if tunggu else "-"
+
+            print(f"\n[{bidang}]")
+            print(f"  Total pasien       : {len(pasien_list)}")
+            print(f"  Selesai            : {len(selesai)}")
+            print(f"  Dilewati           : {len(dilewati)}")
+            print(f"  Belum terlayani    : {len(belum)}")
+            print(f"  Rata-rata tunggu   : {rata2}")
+
+            if dilewati:
+                print("  Pasien yang dilewati (tidak hadir):")
+                for p in dilewati:
+                    kode = self._kode_antrean(bidang, p["nomor_urut"])
+                    print(f"    - {kode}  {p['nama']} ({p['umur']} th) | Keluhan: {p['keluhan']}")
+                    print(f"      Daftar: {p.get('waktu_daftar', '-')} | Dipanggil: {p.get('waktu_dipanggil', '-')}")
+                    semua_dilewati.append((bidang, p))
+
+            total["semua"] += len(pasien_list)
+            total[STATUS_SELESAI] += len(selesai)
+            total[STATUS_DILEWATI] += len(dilewati)
+            total["belum"] += len(belum)
+
+        if total["semua"] == 0:
+            print("\n📂 Tidak ada data pasien pada tanggal ini.")
+            return
+
+        print("\n" + "-" * 60)
+        print(f" TOTAL SEMUA POLI: {total['semua']} pasien | Selesai: {total[STATUS_SELESAI]} | "
+              f"Dilewati: {total[STATUS_DILEWATI]} | Belum terlayani: {total['belum']}")
+
+        if semua_dilewati:
+            print("\n Ringkasan nama pasien yang dilewati:")
+            for bidang, p in semua_dilewati:
+                print(f"   {self._kode_antrean(bidang, p['nomor_urut'])} - {p['nama']} ({bidang})")
+        print("=" * 60)
+
+    def _tanggal_tersedia(self):
+        """Tanggal yang punya data pasien, terbaru lebih dulu"""
+        return sorted(
+            (t for t, d in self.semua_hari.items() if any(d["antrean"].values())),
+            reverse=True,
+        )
+
+    def _menu_rekap_tanggal(self):
+        tanggal_list = self._tanggal_tersedia()
+        if not tanggal_list:
+            print("📂 Belum ada data pasien yang tercatat.")
+            return
+
+        print("\n--- PILIH TANGGAL REKAP ---")
+        for idx, tgl in enumerate(tanggal_list, start=1):
+            total = sum(len(v) for v in self.semua_hari[tgl]["antrean"].values())
+            label = " (hari ini)" if tgl == self.tanggal else ""
+            print(f"{idx}. {tgl}{label} - {total} pasien")
+
+        pilihan = self._input_angka("Pilih tanggal (angka): ", 1, len(tanggal_list))
+        if pilihan is None:
+            return
+        tanggal = tanggal_list[pilihan - 1]
+        self._cetak_laporan(tanggal, self.semua_hari[tanggal]["antrean"])
+
+    def menu_laporan(self):
+        """Laporan harian & riwayat (khusus petugas, butuh PIN)"""
+        print("\n=== REKAP & RIWAYAT ===")
+        if not self._verifikasi_pin():
+            print("🔒 Akses ditolak.")
+            return
+
+        while True:
+            print("\n1. Rekap hari ini")
+            print("2. Rekap hari tertentu")
+            print("3. Kembali ke menu utama")
+            pilihan = input("Pilih (1-3): ").strip()
+
+            if pilihan == "1":
+                self._cetak_laporan(self.tanggal, self.antrean_per_bidang)
+            elif pilihan == "2":
+                self._menu_rekap_tanggal()
+            elif pilihan == "3":
+                break
+            else:
+                print("❌ Pilihan tidak valid. Silakan masukkan angka 1-3.")
+
+    # ------------------------------------------------------------------
     # Menu utama
     # ------------------------------------------------------------------
     def jalankan(self):
@@ -327,9 +484,10 @@ class SistemRumahSakit:
                 print("1. Daftar sebagai Pasien")
                 print("2. Cek Status Antrean")
                 print("3. Masuk sebagai Dokter")
-                print("4. Keluar dari Aplikasi")
+                print("4. Laporan & Riwayat (Petugas)")
+                print("5. Keluar dari Aplikasi")
 
-                pilihan = input("Pilih menu (1-4): ").strip()
+                pilihan = input("Pilih menu (1-5): ").strip()
 
                 if pilihan == "1":
                     self.menu_pasien()
@@ -338,9 +496,11 @@ class SistemRumahSakit:
                 elif pilihan == "3":
                     self.menu_dokter()
                 elif pilihan == "4":
+                    self.menu_laporan()
+                elif pilihan == "5":
                     break
                 else:
-                    print("❌ Pilihan tidak valid. Silakan masukkan angka 1-4.")
+                    print("❌ Pilihan tidak valid. Silakan masukkan angka 1-5.")
         except (KeyboardInterrupt, EOFError):
             print()
 
