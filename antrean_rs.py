@@ -4,13 +4,16 @@ import re
 import shutil
 from datetime import date, datetime
 
+# File disimpan di folder yang sama dengan script (bukan tergantung folder terminal)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-FILE_DATABASE = os.path.join(DATA_DIR, "antrean.json")
+FILE_DATABASE = os.path.join(DATA_DIR, "antrean.json")  # satu file berisi semua hari
 
+# PIN dokter bisa diganti lewat environment variable PIN_DOKTER
 PIN_DOKTER = os.environ.get("PIN_DOKTER", "1234")
 MAKS_PERCOBAAN_PIN = 3
 
+# Bidang -> kode awalan nomor antrean (contoh: U-001)
 BIDANG_KODE = {
     "Dokter Umum": "U",
     "Dokter Gigi": "G",
@@ -33,7 +36,7 @@ class SistemRumahSakit:
         self.muat_data()
 
     # ------------------------------------------------------------------
-    # Penyimpanan data 
+    # Penyimpanan data (satu file, semua hari di dalamnya)
     # ------------------------------------------------------------------
     def _hari_kosong(self):
         return {
@@ -53,7 +56,7 @@ class SistemRumahSakit:
             if not isinstance(pasien_list, list):
                 pasien_list = []
             for p in pasien_list:
-                p.setdefault("status", STATUS_MENUNGGU)
+                p.setdefault("status", STATUS_MENUNGGU)  # kompatibel dengan data versi lama
             hari["antrean"][bidang] = pasien_list
             try:
                 hari["counter"][bidang] = max(int(counter.get(bidang, 0)), len(pasien_list))
@@ -108,6 +111,7 @@ class SistemRumahSakit:
         else:
             hasil_migrasi = self._migrasi_file_lama()
 
+        # Nomor urut otomatis mulai dari 1 lagi setiap hari baru
         if self.tanggal not in self.semua_hari:
             self.semua_hari[self.tanggal] = self._hari_kosong()
         hari_ini = self.semua_hari[self.tanggal]
@@ -121,6 +125,7 @@ class SistemRumahSakit:
 
     def simpan_data(self):
         """Menyimpan data secara atomik (tulis ke file sementara lalu ganti)"""
+        # Hari tanpa pasien tidak perlu disimpan
         data = {"hari": {t: d for t, d in self.semua_hari.items() if any(d["antrean"].values())}}
         sementara = FILE_DATABASE + ".tmp"
         try:
@@ -294,7 +299,7 @@ class SistemRumahSakit:
     def _panggil_berikutnya(self, bidang: str):
         sedang = self._pasien_sedang_dipanggil(bidang)
         if sedang:
-            sedang["status"] = STATUS_SELESAI
+            sedang["status"] = STATUS_SELESAI  # pasien sebelumnya dianggap selesai
             sedang["waktu_selesai"] = self._sekarang()
 
         menunggu = self._pasien_menunggu(bidang)
