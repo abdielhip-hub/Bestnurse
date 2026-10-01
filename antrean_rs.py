@@ -2,18 +2,23 @@ import json
 import os
 import re
 import shutil
-from datetime import date, datetime
+from datetime import datetime, time, timedelta
 
-# File disimpan di folder yang sama dengan script (bukan tergantung folder terminal)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-FILE_DATABASE = os.path.join(DATA_DIR, "antrean.json")  # satu file berisi semua hari
+FILE_DATABASE = os.path.join(DATA_DIR, "antrean.json")
 
-# PIN dokter bisa diganti lewat environment variable PIN_DOKTER
 PIN_DOKTER = os.environ.get("PIN_DOKTER", "1234")
 MAKS_PERCOBAAN_PIN = 3
 
-# Bidang -> kode awalan nomor antrean (contoh: U-001)
+JAM_BUKA = time(8, 0)
+JAM_TUTUP = time(20, 0)
+
+BATAS_PANGGIL_ULANG_JAM = 2
+BATAS_PANGGIL_ULANG = (
+    datetime.combine(datetime(2000, 1, 1), JAM_TUTUP) - timedelta(hours=BATAS_PANGGIL_ULANG_JAM)
+).time()
+
 BIDANG_KODE = {
     "Dokter Umum": "U",
     "Dokter Gigi": "G",
@@ -29,14 +34,58 @@ STATUS_DILEWATI = "dilewati"
 
 
 class SistemRumahSakit:
-    def __init__(self, nama_rs: str):
+    def __init__(self, nama_rs: str, pewaktu=datetime.now):
+        """
+        pewaktu: fungsi yang mengembalikan waktu sekarang (datetime).
+        Default datetime.now; bisa diganti saat pengujian.
+        """
         self.nama_rs = nama_rs
         self.daftar_bidang = list(BIDANG_KODE)
-        self.tanggal = date.today().isoformat()
+        self._pewaktu = pewaktu
+        self.tanggal = None
+        self.antrean_per_bidang = {}
+        self.counter_nomor_urut = {}
         self.muat_data()
 
     # ------------------------------------------------------------------
-    # Penyimpanan data (satu file, semua hari di dalamnya)
+    # Waktu & jam operasional
+    # ------------------------------------------------------------------
+    def _hari_ini_iso(self) -> str:
+        return self._pewaktu().date().isoformat()
+
+    def _sekarang(self) -> str:
+        return self._pewaktu().strftime("%H:%M:%S")
+
+    def _sedang_buka(self) -> bool:
+        return JAM_BUKA <= self._pewaktu().time() < JAM_TUTUP
+
+    def _masih_bisa_panggil_ulang(self) -> bool:
+        return self._sedang_buka() and self._pewaktu().time() < BATAS_PANGGIL_ULANG
+
+    def _cek_buka(self) -> bool:
+        """Menampilkan pesan tutup jika di luar jam operasional"""
+        if self._sedang_buka():
+            return True
+        print("\n" + "=" * 45)
+        print("🏥 MOHON MAAF, POLIKLINIK SEDANG TUTUP")
+        print(f"   Jam operasional: {JAM_BUKA:%H:%M} - {JAM_TUTUP:%H:%M}")
+        print("=" * 45)
+        return False
+
+    def _sinkron_tanggal(self):
+        """Pindah ke data hari ini jika tanggal berganti saat program masih berjalan"""
+        hari_ini = self._hari_ini_iso()
+        if hari_ini == self.tanggal:
+            return
+        self.tanggal = hari_ini
+        if hari_ini not in self.semua_hari:
+            self.semua_hari[hari_ini] = self._hari_kosong()
+        data_hari = self.semua_hari[hari_ini]
+        self.antrean_per_bidang = data_hari["antrean"]
+        self.counter_nomor_urut = data_hari["counter"]
+
+    # ------------------------------------------------------------------
+    # Penyimpanan data
     # ------------------------------------------------------------------
     def _hari_kosong(self):
         return {
@@ -56,7 +105,7 @@ class SistemRumahSakit:
             if not isinstance(pasien_list, list):
                 pasien_list = []
             for p in pasien_list:
-                p.setdefault("status", STATUS_MENUNGGU)  # kompatibel dengan data versi lama
+                p.setdefault("status", STATUS_MENUNGGU)
             hari["antrean"][bidang] = pasien_list
             try:
                 hari["counter"][bidang] = max(int(counter.get(bidang, 0)), len(pasien_list))
@@ -84,7 +133,7 @@ class SistemRumahSakit:
             data = self._baca_json(os.path.join(BASE_DIR, nama))
             if not data or "antrean" not in data:
                 continue
-            tanggal = str(data.get("tanggal") or cocok.group(1) or self.tanggal)
+            tanggal = str(data.get("tanggal") or cocok.group(1) or self._hari_ini_iso())
             self.semua_hari[tanggal] = self._normalisasi_hari(data)
             jumlah += 1
         return jumlah
@@ -111,12 +160,7 @@ class SistemRumahSakit:
         else:
             hasil_migrasi = self._migrasi_file_lama()
 
-        # Nomor urut otomatis mulai dari 1 lagi setiap hari baru
-        if self.tanggal not in self.semua_hari:
-            self.semua_hari[self.tanggal] = self._hari_kosong()
-        hari_ini = self.semua_hari[self.tanggal]
-        self.antrean_per_bidang = hari_ini["antrean"]
-        self.counter_nomor_urut = hari_ini["counter"]
+        self._sinkron_tanggal()
 
         if hasil_migrasi:
             self.simpan_data()
@@ -125,7 +169,6 @@ class SistemRumahSakit:
 
     def simpan_data(self):
         """Menyimpan data secara atomik (tulis ke file sementara lalu ganti)"""
-        # Hari tanpa pasien tidak perlu disimpan
         data = {"hari": {t: d for t, d in self.semua_hari.items() if any(d["antrean"].values())}}
         sementara = FILE_DATABASE + ".tmp"
         try:
@@ -170,14 +213,15 @@ class SistemRumahSakit:
                 return p
         return None
 
+    def _pasien_dengan_status(self, bidang: str, status: str):
+        return [p for p in self.antrean_per_bidang[bidang] if p["status"] == status]
+
     def _pasien_sedang_dipanggil(self, bidang: str):
-        for p in self.antrean_per_bidang[bidang]:
-            if p["status"] == STATUS_DIPANGGIL:
-                return p
-        return None
+        sedang = self._pasien_dengan_status(bidang, STATUS_DIPANGGIL)
+        return sedang[0] if sedang else None
 
     def _pasien_menunggu(self, bidang: str):
-        return [p for p in self.antrean_per_bidang[bidang] if p["status"] == STATUS_MENUNGGU]
+        return self._pasien_dengan_status(bidang, STATUS_MENUNGGU)
 
     # ------------------------------------------------------------------
     # Menu pasien
@@ -203,6 +247,9 @@ class SistemRumahSakit:
             print("❌ Keluhan tidak boleh kosong!")
             return
 
+        if not self._cek_buka():
+            return
+
         self.counter_nomor_urut[bidang] += 1
         no_urut = self.counter_nomor_urut[bidang]
         menunggu_didepan = len(self._pasien_menunggu(bidang))
@@ -213,7 +260,7 @@ class SistemRumahSakit:
             "umur": umur,
             "keluhan": keluhan,
             "status": STATUS_MENUNGGU,
-            "waktu_daftar": datetime.now().strftime("%H:%M:%S"),
+            "waktu_daftar": self._sekarang(),
         })
         self.simpan_data()
 
@@ -258,6 +305,12 @@ class SistemRumahSakit:
         if pasien["status"] == STATUS_MENUNGGU:
             didepan = sum(1 for p in self._pasien_menunggu(bidang) if p["nomor_urut"] < nomor)
             print(f"Antrean di depan Anda: {didepan} orang")
+        elif pasien["status"] == STATUS_DILEWATI:
+            if self._masih_bisa_panggil_ulang():
+                print(f"Anda dilewati. Segera temui petugas/dokter, Anda masih bisa dipanggil "
+                      f"kembali sampai pukul {BATAS_PANGGIL_ULANG:%H:%M}.")
+            else:
+                print("Anda dilewati dan batas panggil ulang sudah lewat. Silakan daftar kembali.")
 
     # ------------------------------------------------------------------
     # Menu dokter
@@ -272,16 +325,22 @@ class SistemRumahSakit:
     def _tampilkan_daftar(self, bidang: str):
         menunggu = self._pasien_menunggu(bidang)
         sedang = self._pasien_sedang_dipanggil(bidang)
-        selesai = sum(1 for p in self.antrean_per_bidang[bidang] if p["status"] == STATUS_SELESAI)
+        selesai = self._pasien_dengan_status(bidang, STATUS_SELESAI)
+        dilewati = self._pasien_dengan_status(bidang, STATUS_DILEWATI)
 
         print("\n" + "=" * 45)
         print(f" PANEL DOKTER - POLI {bidang.upper()}")
         print("=" * 45)
-        print(f"Menunggu: {len(menunggu)} | Selesai: {selesai}")
+        print(f"Menunggu: {len(menunggu)} | Selesai: {len(selesai)} | Dilewati: {len(dilewati)}")
 
         if sedang:
             print(f"\n▶ SEDANG DIPERIKSA: {self._kode_antrean(bidang, sedang['nomor_urut'])} - {sedang['nama']}")
             print(f"  Keluhan: {sedang['keluhan']}")
+
+        if dilewati:
+            print(f"\n⏭ DILEWATI (bisa dipanggil kembali sampai {BATAS_PANGGIL_ULANG:%H:%M}):")
+            for p in dilewati:
+                print(f"   {self._kode_antrean(bidang, p['nomor_urut'])} - {p['nama']}")
 
         if not menunggu:
             print("\n📂 Tidak ada pasien yang menunggu.")
@@ -296,34 +355,97 @@ class SistemRumahSakit:
             print(f"Keluhan  : {p['keluhan']}")
         print("-----------------------------------")
 
-    def _panggil_berikutnya(self, bidang: str):
+    def _mulai_panggil(self, bidang: str, pasien: dict, ulang: bool = False):
+        pasien["status"] = STATUS_DIPANGGIL
+        pasien.setdefault("waktu_dipanggil", self._sekarang())
+        if ulang:
+            pasien["waktu_dipanggil_ulang"] = self._sekarang()
+        self.simpan_data()
+        awalan = "Memanggil KEMBALI" if ulang else "Memanggil"
+        print(f"\n📢 {awalan} {self._kode_antrean(bidang, pasien['nomor_urut'])} - {pasien['nama']}")
+        print(f"   Umur: {pasien['umur']} tahun | Keluhan: {pasien['keluhan']}")
+
+    def _wajib_selesaikan_dulu(self, bidang: str) -> bool:
+        """True jika masih ada pasien yang belum selesai diperiksa"""
         sedang = self._pasien_sedang_dipanggil(bidang)
         if sedang:
-            sedang["status"] = STATUS_SELESAI  # pasien sebelumnya dianggap selesai
-            sedang["waktu_selesai"] = self._sekarang()
+            print(f"❌ Selesaikan dulu pemeriksaan {self._kode_antrean(bidang, sedang['nomor_urut'])} "
+                  f"- {sedang['nama']} (menu 2, isi hasil pemeriksaan) atau lewati pasien tersebut.")
+            return True
+        return False
 
+    def _panggil_berikutnya(self, bidang: str):
+        if self._wajib_selesaikan_dulu(bidang):
+            return
         menunggu = self._pasien_menunggu(bidang)
         if not menunggu:
-            self.simpan_data()
             print("📂 Tidak ada pasien lagi yang menunggu.")
             return
+        self._mulai_panggil(bidang, menunggu[0])
 
-        berikutnya = menunggu[0]
-        berikutnya["status"] = STATUS_DIPANGGIL
-        berikutnya["waktu_dipanggil"] = self._sekarang()
-        self.simpan_data()
-        print(f"\n📢 Memanggil {self._kode_antrean(bidang, berikutnya['nomor_urut'])} - {berikutnya['nama']}")
-        print(f"   Umur: {berikutnya['umur']} tahun | Keluhan: {berikutnya['keluhan']}")
-
-    def _akhiri_pasien(self, bidang: str, status_baru: str):
+    def _selesaikan_pemeriksaan(self, bidang: str):
+        """Dokter mengisi laporan final (diagnosis) lalu pasien ditandai selesai"""
         sedang = self._pasien_sedang_dipanggil(bidang)
         if not sedang:
             print("❌ Tidak ada pasien yang sedang dipanggil.")
             return
-        sedang["status"] = status_baru
+
+        kode = self._kode_antrean(bidang, sedang["nomor_urut"])
+        print(f"\n--- HASIL PEMERIKSAAN {kode} - {sedang['nama']} ---")
+        print(f"Keluhan pasien: {sedang['keluhan']}")
+        diagnosis = input("Diagnosis / penyakit (wajib): ").strip()
+        if not diagnosis:
+            print("❌ Diagnosis wajib diisi. Pemeriksaan belum diselesaikan.")
+            return
+        catatan = input("Tindakan / resep / catatan (boleh kosong): ").strip()
+
+        sedang["status"] = STATUS_SELESAI
+        sedang["diagnosis"] = diagnosis
+        sedang["catatan_dokter"] = catatan
         sedang["waktu_selesai"] = self._sekarang()
         self.simpan_data()
-        print(f"✅ {self._kode_antrean(bidang, sedang['nomor_urut'])} ditandai {status_baru}.")
+
+        print("\n" + "=" * 45)
+        print("      LAPORAN PEMERIKSAAN FINAL")
+        print("=" * 45)
+        print(f"No. Antrean : {kode} ({bidang})")
+        print(f"Pasien      : {sedang['nama']} ({sedang['umur']} tahun)")
+        print(f"Keluhan     : {sedang['keluhan']}")
+        print(f"Diagnosis   : {diagnosis}")
+        if catatan:
+            print(f"Catatan     : {catatan}")
+        print("=" * 45)
+
+    def _lewati_pasien(self, bidang: str):
+        sedang = self._pasien_sedang_dipanggil(bidang)
+        if not sedang:
+            print("❌ Tidak ada pasien yang sedang dipanggil.")
+            return
+        sedang["status"] = STATUS_DILEWATI
+        sedang["waktu_dilewati"] = self._sekarang()
+        self.simpan_data()
+        print(f"⏭ {self._kode_antrean(bidang, sedang['nomor_urut'])} dilewati. "
+              f"Masih bisa dipanggil kembali sampai pukul {BATAS_PANGGIL_ULANG:%H:%M}.")
+
+    def _panggil_ulang_dilewati(self, bidang: str):
+        if self._wajib_selesaikan_dulu(bidang):
+            return
+        dilewati = self._pasien_dengan_status(bidang, STATUS_DILEWATI)
+        if not dilewati:
+            print("📂 Tidak ada pasien yang dilewati.")
+            return
+        if not self._masih_bisa_panggil_ulang():
+            print(f"❌ Batas panggil ulang (pukul {BATAS_PANGGIL_ULANG:%H:%M}) sudah lewat. "
+                  "Pasien yang dilewati tidak dapat dipanggil kembali.")
+            return
+
+        print("\n--- PASIEN YANG DILEWATI ---")
+        for idx, p in enumerate(dilewati, start=1):
+            print(f"{idx}. {self._kode_antrean(bidang, p['nomor_urut'])} - {p['nama']} | {p['keluhan']}")
+        pilihan = self._input_angka("Pilih pasien yang dipanggil kembali: ", 1, len(dilewati))
+        if pilihan is None:
+            return
+        self._mulai_panggil(bidang, dilewati[pilihan - 1], ulang=True)
 
     def menu_dokter(self):
         """Panel khusus dokter"""
@@ -337,31 +459,35 @@ class SistemRumahSakit:
             return
 
         while True:
+            if not self._cek_buka():
+                break
             self._tampilkan_daftar(bidang)
             print("\n1. Panggil pasien berikutnya")
-            print("2. Tandai pasien sekarang selesai")
+            print("2. Selesaikan pemeriksaan pasien sekarang (isi hasil pemeriksaan)")
             print("3. Lewati pasien sekarang (tidak hadir)")
-            print("4. Kembali ke menu utama")
-            pilihan = input("Pilih (1-4): ").strip()
+            print("4. Panggil kembali pasien yang dilewati")
+            print("5. Kembali ke menu utama")
+            pilihan = input("Pilih (1-5): ").strip()
+
+            if not self._cek_buka():
+                break
 
             if pilihan == "1":
                 self._panggil_berikutnya(bidang)
             elif pilihan == "2":
-                self._akhiri_pasien(bidang, STATUS_SELESAI)
+                self._selesaikan_pemeriksaan(bidang)
             elif pilihan == "3":
-                self._akhiri_pasien(bidang, STATUS_DILEWATI)
+                self._lewati_pasien(bidang)
             elif pilihan == "4":
+                self._panggil_ulang_dilewati(bidang)
+            elif pilihan == "5":
                 break
             else:
-                print("❌ Pilihan tidak valid. Silakan masukkan angka 1-4.")
+                print("❌ Pilihan tidak valid. Silakan masukkan angka 1-5.")
 
     # ------------------------------------------------------------------
     # Laporan & riwayat
     # ------------------------------------------------------------------
-    @staticmethod
-    def _sekarang() -> str:
-        return datetime.now().strftime("%H:%M:%S")
-
     @staticmethod
     def _selisih_menit(awal, akhir):
         """Selisih dua jam (HH:MM:SS) dalam menit; None jika data tidak lengkap"""
@@ -373,7 +499,7 @@ class SistemRumahSakit:
         return selisih if selisih >= 0 else None
 
     def _cetak_laporan(self, tanggal: str, antrean: dict):
-        """Mencetak ringkasan per poli + daftar nama pasien yang dilewati"""
+        """Mencetak ringkasan per poli, hasil pemeriksaan, dan nama pasien yang dilewati"""
         print("\n" + "=" * 60)
         print(f" LAPORAN ANTREAN - {tanggal}")
         print("=" * 60)
@@ -401,6 +527,16 @@ class SistemRumahSakit:
             print(f"  Dilewati           : {len(dilewati)}")
             print(f"  Belum terlayani    : {len(belum)}")
             print(f"  Rata-rata tunggu   : {rata2}")
+
+            if selesai:
+                print("  Hasil pemeriksaan (pasien selesai):")
+                for p in selesai:
+                    kode = self._kode_antrean(bidang, p["nomor_urut"])
+                    print(f"    - {kode}  {p['nama']} ({p['umur']} th)")
+                    print(f"      Keluhan  : {p['keluhan']}")
+                    print(f"      Diagnosis: {p.get('diagnosis') or '-'}")
+                    if p.get("catatan_dokter"):
+                        print(f"      Catatan  : {p['catatan_dokter']}")
 
             if dilewati:
                 print("  Pasien yang dilewati (tidak hadir):")
@@ -467,7 +603,11 @@ class SistemRumahSakit:
             print("3. Kembali ke menu utama")
             pilihan = input("Pilih (1-3): ").strip()
 
+            if not self._cek_buka():
+                break
+
             if pilihan == "1":
+                self._sinkron_tanggal()
                 self._cetak_laporan(self.tanggal, self.antrean_per_bidang)
             elif pilihan == "2":
                 self._menu_rekap_tanggal()
@@ -483,16 +623,27 @@ class SistemRumahSakit:
         """Menu Utama"""
         try:
             while True:
+                self._sinkron_tanggal()
+                status = "🟢 BUKA" if self._sedang_buka() else "🔴 TUTUP"
                 print("\n" + "=" * 45)
                 print(f"   SISTEM ANTREAN POLIKLINIK {self.nama_rs.upper()}")
+                print(f"   Jam operasional {JAM_BUKA:%H:%M}-{JAM_TUTUP:%H:%M} | {status}")
                 print("=" * 45)
                 print("1. Daftar sebagai Pasien")
                 print("2. Cek Status Antrean")
                 print("3. Masuk sebagai Dokter")
-                print("4. Laporan & Riwayat (Petugas)")
+                print("4. Laporan & Riwayat")
                 print("5. Keluar dari Aplikasi")
 
                 pilihan = input("Pilih menu (1-5): ").strip()
+
+                if pilihan == "5":
+                    break
+                if pilihan not in ("1", "2", "3", "4"):
+                    print("❌ Pilihan tidak valid. Silakan masukkan angka 1-5.")
+                    continue
+                if not self._cek_buka():
+                    continue
 
                 if pilihan == "1":
                     self.menu_pasien()
@@ -502,10 +653,6 @@ class SistemRumahSakit:
                     self.menu_dokter()
                 elif pilihan == "4":
                     self.menu_laporan()
-                elif pilihan == "5":
-                    break
-                else:
-                    print("❌ Pilihan tidak valid. Silakan masukkan angka 1-5.")
         except (KeyboardInterrupt, EOFError):
             print()
 
@@ -513,5 +660,5 @@ class SistemRumahSakit:
 
 
 if __name__ == "__main__":
-    rs = SistemRumahSakit("RS Sehat Sentosa")
+    rs = SistemRumahSakit("Nyandatau")
     rs.jalankan()
